@@ -8,17 +8,48 @@ Authentication: Telegram initData HMAC-SHA256 (standard TWA).
 import hashlib
 import hmac
 import json
+import os
 import random
+import time
 import urllib.parse
 import urllib.request as _urllib_req
+from collections import defaultdict
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config import BOT_TOKEN, MAX_FAILURES, TEACHER_ID
+
+# initData max age (replay protection). Override via env if needed.
+_INITDATA_TTL = int(os.getenv("INITDATA_TTL", "86400"))  # 24h
+
+# ── Lightweight in-memory rate limiter (per-process) ────────────────
+_RATE_BUCKETS: dict = defaultdict(list)
+
+
+def _rate_limit(key: str, limit: int, window: int = 60):
+    """Raise 429 if `key` exceeds `limit` requests per `window` seconds."""
+    now = time.time()
+    bucket = _RATE_BUCKETS[key]
+    cutoff = now - window
+    drop = 0
+    while drop < len(bucket) and bucket[drop] < cutoff:
+        drop += 1
+    if drop:
+        del bucket[:drop]
+    if len(bucket) >= limit:
+        raise HTTPException(status_code=429, detail="Too many requests, please slow down")
+    bucket.append(now)
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 import database as db
 from words import (
     BOOKS_INFO, get_lesson_words, get_word_by_id, get_words_by_ids,
@@ -50,6 +81,14 @@ def validate_init_data(init_data: str) -> dict:
     if not hmac.compare_digest(expected, received_hash):
         raise HTTPException(status_code=401, detail="Invalid initData")
 
+    # Replay protection: reject stale initData (Telegram sets auth_date).
+    auth_date = parsed.get("auth_date")
+    try:
+        if not auth_date or (time.time() - int(auth_date)) > _INITDATA_TTL:
+            raise HTTPException(status_code=401, detail="initData expired, reopen the app")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid auth_date")
+
     user_json = parsed.get("user", "{}")
     try:
         return json.loads(user_json)
@@ -78,74 +117,74 @@ async def get_current_user(x_init_data: str = Header(..., alias="X-Init-Data")):
 # ── Models ──────────────────────────────────────────────────────────
 
 class CreateUserBody(BaseModel):
-    name: str
-    lang: str = "ru"
-    tg_id: int  # frontend sends tg_id (from initData) + name/lang
+    name: str = Field(..., max_length=100)
+    lang: str = Field("ru", max_length=8)
+    tg_id: int = 0  # ignored server-side; id is taken from verified initData
 
 
 class UpdateLangBody(BaseModel):
-    lang: str
+    lang: str = Field(..., max_length=8)
 
 
 class UpdateNameBody(BaseModel):
-    name: str
+    name: str = Field(..., max_length=100)
 
 
 class QuizStartBody(BaseModel):
-    book: int
-    lesson: int
-    mode: str = "visual"  # "visual" | "written" | "arabic"
+    book: int = Field(..., ge=1, le=20)
+    lesson: int = Field(..., ge=1, le=300)
+    mode: str = Field("visual", max_length=16)  # "visual" | "written" | "arabic"
 
 
 class QuizAnswerBody(BaseModel):
-    word_id: int         # correct word id (from question)
-    chosen_id: int       # word id user picked (visual) or -1 (written)
-    typed: Optional[str] = None  # user typed answer (written/arabic modes)
-    mode: str = "visual"
+    word_id: int = Field(..., ge=0)      # correct word id (from question)
+    chosen_id: int = Field(..., ge=-1)   # word id user picked (visual) or -1 (written)
+    typed: Optional[str] = Field(None, max_length=200)  # user typed answer
+    mode: str = Field("visual", max_length=16)
 
 
 class UmrahQuizStartBody(BaseModel):
-    section_key: str
-    count: int = 10
+    section_key: str = Field(..., max_length=64)
+    count: int = Field(10, ge=1, le=50)
 
 
 class UmrahQuizAnswerBody(BaseModel):
     # encoded as "sec_idx:ph_idx"
-    correct_ref: str
-    chosen_ref: Optional[str] = None   # visual mode
-    typed: Optional[str] = None        # written mode
-    mode: str = "visual"
-    lang: str = "ru"
+    correct_ref: str = Field(..., max_length=20)
+    chosen_ref: Optional[str] = Field(None, max_length=20)   # visual mode
+    typed: Optional[str] = Field(None, max_length=200)       # written mode
+    mode: str = Field("visual", max_length=16)
+    lang: str = Field("ru", max_length=8)
 
 
 class AskQuestionBody(BaseModel):
-    question: str
+    question: str = Field(..., max_length=2000)
 
 
 class AnswerBody(BaseModel):
-    answer: str
+    answer: str = Field(..., max_length=4096)
 
 
 class BroadcastBody(BaseModel):
-    message: str
+    message: str = Field(..., max_length=4096)
 
 
 class PersonalMessageBody(BaseModel):
     user_id: int
-    message: str
+    message: str = Field(..., max_length=4096)
 
 
 class BgConfigBody(BaseModel):
-    bg_url: str
+    bg_url: str = Field(..., max_length=4_000_000)  # data: image URL or https link
 
 
 class ReminderBody(BaseModel):
-    reminder_time: Optional[str] = None   # "HH:MM" or null to disable
-    timezone: str = "Europe/Moscow"
+    reminder_time: Optional[str] = Field(None, max_length=5)   # "HH:MM" or null
+    timezone: str = Field("Europe/Moscow", max_length=64)
 
 
 class SessionBody(BaseModel):
-    seconds: int  # duration of the app session in seconds
+    seconds: int = Field(..., ge=0, le=86400)  # app session length (sec)
 
 
 # ── Factory ─────────────────────────────────────────────────────────
@@ -157,20 +196,33 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
     # Note: if pool is None, db._pool must be set before any requests arrive
 
     app = FastAPI(title="Arabic Path Mini App API", version="1.0.0", lifespan=lifespan)
+
+    # Lock CORS to the mini-app origin(s). Override via ALLOWED_ORIGINS env (comma-separated).
+    _allowed = os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://repository-name-arabic-path-miniapp.vercel.app",
+    ).split(",")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=[o.strip() for o in _allowed if o.strip()],
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "X-Init-Data", "Authorization"],
-        expose_headers=["*"],
     )
 
-    # ── TTS proxy (no auth) ─────────────────────────────────────────
+    @app.middleware("http")
+    async def _security_headers(request: Request, call_next):
+        resp = await call_next(request)
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        return resp
+
+    # ── TTS proxy (no auth — called by <audio>; protected by rate limit) ──
 
     @app.get("/api/tts")
-    def tts_proxy(text: str):
+    def tts_proxy(text: str, request: Request):
         if not text or len(text) > 300:
             raise HTTPException(status_code=400, detail="invalid text")
+        _rate_limit(f"tts:{_client_ip(request)}", limit=40, window=60)
         url = (
             "https://translate.google.com/translate_tts"
             f"?ie=UTF-8&q={urllib.parse.quote(text)}&tl=ar&client=tw-ob"
@@ -186,8 +238,8 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
         try:
             with _urllib_req.urlopen(req, timeout=8) as resp:
                 audio = resp.read()
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+        except Exception:
+            raise HTTPException(status_code=502, detail="tts upstream failed")
         return Response(
             content=audio,
             media_type="audio/mpeg",
@@ -202,12 +254,9 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
 
     @app.get("/api/webapp/debug")
     async def debug(request: Request):
+        # Do NOT echo initData (no preview/length) — avoids leaking token material.
         raw = request.headers.get("x-init-data", "")
-        return {
-            "has_init_data": bool(raw),
-            "length": len(raw),
-            "preview": raw[:40] if raw else "",
-        }
+        return {"has_init_data": bool(raw)}
 
     # ── User endpoints ───────────────────────────────────────────────
 
@@ -588,7 +637,10 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
         if body.mode == "visual":
             if not body.chosen_ref:
                 raise HTTPException(status_code=400, detail="chosen_ref required")
-            ch_sec, ch_ph = map(int, body.chosen_ref.split(":"))
+            try:
+                ch_sec, ch_ph = map(int, body.chosen_ref.split(":"))
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="Invalid chosen_ref")
             is_correct = (ch_sec == c_sec and ch_ph == c_ph)
         else:  # written
             content_lang = lang if lang in ("ru", "tj", "en", "uz") else "ru"
@@ -673,6 +725,7 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
 
     @app.post("/api/webapp/question", status_code=201)
     async def ask_question(body: AskQuestionBody, user=Depends(get_current_user)):
+        _rate_limit(f"ask:{user['user_id']}", limit=5, window=60)
         text = body.question.strip()
         if not text:
             raise HTTPException(status_code=400, detail="Question cannot be empty")
@@ -847,6 +900,10 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
     async def set_global_bg(body: BgConfigBody, user=Depends(get_current_user)):
         if user["user_id"] != TEACHER_ID:
             raise HTTPException(status_code=403, detail="Teacher only")
+        bg = body.bg_url.strip()
+        # Only allow inline image data URLs or https links (blocks javascript:/data:text etc.)
+        if bg and not (bg.startswith("data:image/") or bg.startswith("https://")):
+            raise HTTPException(status_code=400, detail="bg_url must be a data:image or https URL")
         await db._pool.execute(
             "CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT);"
         )
@@ -855,7 +912,7 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
             INSERT INTO app_config (key, value) VALUES ('global_bg', $1)
             ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
             """,
-            body.bg_url,
+            bg,
         )
         return {"ok": True}
 
