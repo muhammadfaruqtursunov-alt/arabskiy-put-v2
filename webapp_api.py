@@ -932,6 +932,9 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
                 "current_lesson": s["current_lesson"],
                 "learned": int(s.get("learned", 0)),
                 "total_app_time": int(s.get("total_app_time") or 0),
+                "created_at": s["created_at"].isoformat() if s.get("created_at") else None,
+                "last_activity": s.get("last_activity"),
+                "streak": int(s.get("streak") or 0),
             }
             for s in students
         ]
