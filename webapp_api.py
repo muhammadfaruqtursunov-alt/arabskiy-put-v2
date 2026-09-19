@@ -250,7 +250,16 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
 
     @app.get("/api/webapp/health")
     async def health():
-        return {"ok": True, "service": "arabic-path-miniapp"}
+        # words_en / words_uz = how many Medina words carry that translation.
+        # Lets us confirm from outside that a redeploy picked up the new words.py.
+        all_words = [w for b in BOOKS_INFO for w in get_book_words(b)]
+        return {
+            "ok": True,
+            "service": "arabic-path-miniapp",
+            "words": len(all_words),
+            "words_en": sum(1 for w in all_words if w.get("en")),
+            "words_uz": sum(1 for w in all_words if w.get("uz")),
+        }
 
     @app.get("/api/webapp/debug")
     async def debug(request: Request):
