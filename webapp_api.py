@@ -187,6 +187,11 @@ class SessionBody(BaseModel):
     seconds: int = Field(..., ge=0, le=86400)  # app session length (sec)
 
 
+class QuranProgressBody(BaseModel):
+    words: int = Field(..., ge=0, le=4800)   # learned Quran lemmas
+    pages: int = Field(..., ge=0, le=604)    # finished mushaf pages
+
+
 # ── Factory ─────────────────────────────────────────────────────────
 
 def create_app(pool=None, lifespan=None) -> FastAPI:
@@ -256,6 +261,7 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
         return {
             "ok": True,
             "service": "arabic-path-miniapp",
+            "quran_progress": True,   # fingerprint: /quran/progress endpoint is deployed
             "words": len(all_words),
             "words_en": sum(1 for w in all_words if w.get("en")),
             "words_uz": sum(1 for w in all_words if w.get("uz")),
@@ -335,6 +341,13 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Name cannot be empty")
         await db.update_user(user["user_id"], name=name)
         return {"ok": True, "name": name}
+
+    @app.post("/api/webapp/quran/progress")
+    async def quran_progress(body: QuranProgressBody, user=Depends(get_current_user)):
+        """Quran words trainer: store only the counters (for stats / teacher panel)."""
+        _rate_limit(f"quran:{user['user_id']}", limit=30, window=60)
+        await db.set_quran_progress(user["user_id"], body.words, body.pages)
+        return {"ok": True}
 
     @app.post("/api/webapp/user/session")
     async def log_session(body: SessionBody, user=Depends(get_current_user)):
@@ -944,6 +957,8 @@ def create_app(pool=None, lifespan=None) -> FastAPI:
                 "created_at": s["created_at"].isoformat() if s.get("created_at") else None,
                 "last_activity": s.get("last_activity"),
                 "streak": int(s.get("streak") or 0),
+                "quran_words": int(s.get("quran_words") or 0),
+                "quran_pages": int(s.get("quran_pages") or 0),
             }
             for s in students
         ]

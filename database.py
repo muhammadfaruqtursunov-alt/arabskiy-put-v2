@@ -79,6 +79,12 @@ async def init_db(pool):
     await pool.execute("""
         ALTER TABLE users ADD COLUMN IF NOT EXISTS total_app_time INTEGER DEFAULT 0;
     """)
+    # Mini App: Quran words trainer — only counters here; the learner's word
+    # list itself lives in their Telegram CloudStorage.
+    await pool.execute("""
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS quran_words INTEGER DEFAULT 0;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS quran_pages INTEGER DEFAULT 0;
+    """)
     # Migrate old users who had global lesson numbering (1-21 across all books)
     # to per-book numbering: 8→Book 2 Lesson 1, 15→Book 3 Lesson 1, etc.
     await pool.execute("""
@@ -365,6 +371,14 @@ async def get_webapp_stats(user_id: int) -> dict:
         "questions_asked": int(questions_count or 0),
         "total_app_time": int(user.get("total_app_time") or 0),
     }
+
+
+async def set_quran_progress(user_id: int, words: int, pages: int):
+    """Store Quran trainer counters (learned words, finished mushaf pages)."""
+    await _pool.execute(
+        "UPDATE users SET quran_words=$2, quran_pages=$3 WHERE user_id=$1",
+        user_id, words, pages,
+    )
 
 
 async def add_session_time(user_id: int, seconds: int):
